@@ -1,0 +1,20 @@
+{
+  "root": {
+    "type": "question",
+    "text": "Где сейчас проблема?",
+    "options": [
+      {
+        "label": "💼 Работа / Бизнес",
+        "next_node": "work_start"
+      },
+      {
+        "label": "❤️ Отношения / Семья",
+        "next_node": "family_start"
+      },
+      {
+        "label": "🚨 SOS / Экстренно",
+        "next_node": "sos_start"
+      }
+    ]
+  }
+}

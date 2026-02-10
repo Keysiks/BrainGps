@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from app.bot.handlers import init_handlers, router
 from app.core.feedback_db import init_db
+from app.core.analytics_db import init_analytics_db
 from app.core.graph import load_graph
 from app.core.llm import LLMService
 
@@ -42,6 +43,7 @@ async def main() -> None:
     init_handlers(graph, llm_service)
 
     await init_db()
+    await init_analytics_db()
 
     bot = Bot(token=token)
     dp = Dispatcher()

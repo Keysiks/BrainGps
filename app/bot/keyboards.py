@@ -238,6 +238,10 @@ def simulation_kb() -> InlineKeyboardMarkup:
                     text="💡 Подсказка",
                     callback_data="sim:hint",
                 ),
+                InlineKeyboardButton(
+                    text="📝 Черновик",
+                    callback_data="sim:draft",
+                ),
             ],
             [
                 InlineKeyboardButton(

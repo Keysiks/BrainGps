@@ -2,12 +2,13 @@
 
 import asyncio
 import html
+import time
 import uuid
 from typing import Any
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -30,6 +31,9 @@ from app.bot.states import Feedback, Form, Simulation
 from app.core.feedback_db import save_feedback
 from app.core.graph import get_root_node_id, load_graph
 from app.core.llm import LLMService
+from app.core.analytics import track_event, infer_branch
+from app.core.metrics import get_metrics, format_metrics_message
+import os
 
 router = Router(name="brain_gps")
 
@@ -217,6 +221,15 @@ async def _show_node(
     keyboard = build_nav_keyboard(options, include_back=include_back)
     keyboard = with_menu(keyboard)
 
+    data = await state.get_data() if state else {}
+    session_id = data.get("session_id") or "unknown"
+    await track_event(
+        user_id=message_or_callback.from_user.id if message_or_callback.from_user else 0,
+        session_id=session_id,
+        event_name="node_view",
+        node_id=node_id,
+    )
+
     if isinstance(message_or_callback, CallbackQuery):
         q = message_or_callback
         await q.message.edit_text(text=text, reply_markup=keyboard)
@@ -322,13 +335,25 @@ async def _generate_and_send(
     node_id: str,
     inputs: dict[str, str],
     state: FSMContext | None = None,
+    *,
+    success_event_name: str = "final_generated",
 ) -> None:
     """Call LLM and send the result, with Practice Mode button."""
     user_id = target.from_user.id if target.from_user else 0
     LAST_SIMULATION_CONTEXT[user_id] = {"node_id": node_id, "inputs": inputs}
+    data = await state.get_data() if state else {}
+    session_id = data.get("session_id") or "unknown"
 
     if not LLM_SERVICE:
         result = "Ошибка: LLM сервис не настроен."
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="llm_error",
+            node_id=node_id,
+            latency_ms=0,
+            meta={"error": "LLM_SERVICE not initialized"},
+        )
     else:
         node = GLOBAL_GRAPH.get(node_id)
         template_name = node.get("prompt_template", "work_template.j2")
@@ -340,11 +365,36 @@ async def _generate_and_send(
             "inputs": inputs,
             "ui_description": ui_description,
         }
-        result = await asyncio.to_thread(
-            LLM_SERVICE.generate_advice,
-            template_name,
-            context,
-        )
+
+        t0 = time.perf_counter()
+        try:
+            result, latency_ms, prompt_chars, response_chars = await LLM_SERVICE.generate_advice_async(
+                template_name,
+                context,
+            )
+            await track_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_name=success_event_name,
+                node_id=node_id,
+                strategy_id=node_id,
+                latency_ms=latency_ms,
+                model=LLM_SERVICE.model,
+                prompt_chars=prompt_chars,
+                response_chars=response_chars,
+            )
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            result = "Ошибка при генерации совета."
+            error_short = str(e).replace("\n", " ")[:160]
+            await track_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_name="llm_error",
+                node_id=node_id,
+                latency_ms=latency_ms,
+                meta={"error": error_short},
+            )
 
     node = GLOBAL_GRAPH.get(node_id, {})
     strategy_name = (node.get("llm_config") or {}).get("strategy_name")
@@ -421,15 +471,44 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(hint)
 
     root_id = get_root_node_id(GLOBAL_GRAPH)
+    session_id = str(uuid.uuid4())
     await state.update_data(
         nav_stack=[],
         current_view_node_id=root_id,
-        session_id=str(uuid.uuid4()),
+        session_id=session_id,
         last_strategy_id=None,
         last_branch=None,
         pending_feedback=None,
     )
+    await track_event(
+        user_id=message.from_user.id if message.from_user else 0,
+        session_id=session_id,
+        event_name="start",
+    )
     await _show_node(message, root_id, state)
+
+
+@router.message(Command("metrics"))
+@router.message(Command("stats"))
+async def cmd_metrics(message: Message) -> None:
+    """Admin-only metrics command."""
+    admin_ids_str = os.getenv("ADMIN_IDS", "")
+    try:
+        admin_ids = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+    except ValueError:
+        admin_ids = []
+
+    if message.from_user and message.from_user.id not in admin_ids:
+        # Silently ignore for non-admins
+        return
+
+    m7 = await get_metrics(days=7)
+    text7 = format_metrics_message(m7, days=7)
+    
+    m1 = await get_metrics(days=1)
+    text1 = format_metrics_message(m1, days=1)
+    
+    await message.answer(f"{text7}\n\n---\n\n{text1}", parse_mode="Markdown")
 
 
 @router.callback_query(NavCallbackData.filter())
@@ -447,6 +526,36 @@ async def on_nav_callback(
         return
 
     node_type = node.get("type")
+
+    data = await state.get_data()
+    session_id = data.get("session_id") or "unknown"
+    current_node_id = data.get("current_view_node_id")
+
+    # Try to capture static option label (safe: comes from graph, not user text)
+    label: str | None = None
+    if isinstance(current_node_id, str) and current_node_id:
+        current_node = GLOBAL_GRAPH.get(current_node_id)
+        if isinstance(current_node, dict):
+            options = current_node.get("options") or []
+            if isinstance(options, list):
+                for opt in options:
+                    if isinstance(opt, dict) and opt.get("next_node") == node_id:
+                        opt_label = opt.get("label")
+                        if isinstance(opt_label, str):
+                            label = opt_label
+                        break
+
+    meta: dict[str, Any] = {"next_node": node_id}
+    if isinstance(label, str) and label:
+        meta["label"] = label[:120]
+
+    await track_event(
+        user_id=callback.from_user.id if callback.from_user else 0,
+        session_id=session_id,
+        event_name="option_click",
+        node_id=current_node_id,
+        meta=meta,
+    )
 
     if node_type == "question":
         await _push_nav(state, node_id)
@@ -558,7 +667,13 @@ async def final_regen(callback: CallbackQuery, state: FSMContext) -> None:
         feedback_sent_for_message_id=None,
         pending_feedback_message=None,
     )
-    await _generate_and_send(callback, node_id, inputs, state)
+    await _generate_and_send(
+        callback,
+        node_id,
+        inputs,
+        state,
+        success_event_name="regenerate",
+    )
     await _safe_callback_answer(callback)
 
 
@@ -772,6 +887,21 @@ async def start_simulation(callback: CallbackQuery, state: FSMContext) -> None:
         last_user_message=None,
         last_opponent_message=None,
     )
+    data = await state.get_data()
+
+    meta: dict[str, Any] | None = None
+    if isinstance(strategy_name, str) and strategy_name:
+        meta = {"strategy_name": strategy_name[:120]}
+
+    await track_event(
+        user_id=user_id,
+        session_id=data.get("session_id") or "unknown",
+        event_name="sim_start",
+        node_id=ctx["node_id"],
+        strategy_id=ctx["node_id"],
+        meta=meta,
+    )
+
     await state.set_state(Simulation.active)
 
     rules_for_sheet = strategy_rules[:6] if strategy_rules else []
@@ -827,6 +957,13 @@ async def stop_simulation(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id if callback.from_user else 0
     LAST_SIMULATION_CONTEXT.pop(user_id, None)
 
+    await track_event(
+        user_id=user_id,
+        session_id=data_before_clear.get("session_id") or "unknown",
+        event_name="sim_stop",
+        node_id=data_before_clear.get("sim_node_id"),
+    )
+
     await callback.message.edit_text(text="Симуляция остановлена.")
     await callback.answer()
 
@@ -879,20 +1016,58 @@ async def process_sim_message(message: Message, state: FSMContext) -> None:
 
     if not LLM_SERVICE:
         reply = "Ошибка: LLM сервис не настроен."
+        await track_event(
+            user_id=message.from_user.id if message.from_user else 0,
+            session_id=data.get("session_id") or "unknown",
+            event_name="llm_error",
+            node_id=data.get("sim_node_id"),
+            latency_ms=0,
+            meta={"error": "LLM_SERVICE not initialized"},
+        )
     else:
         sim_context = data.get("sim_context")
         if not isinstance(sim_context, str) or not sim_context:
             sim_context = "\n".join(f"{k}: {v}" for k, v in sim_inputs.items()) or "—"
             await state.update_data(sim_context=sim_context)
-        reply = await asyncio.to_thread(
-            LLM_SERVICE.generate_sim_response,
-            sim_context,
-            sim_history[:-1],
-            llm_user_message,
-            data.get("sim_role_name"),
-            data.get("sim_opponent_style"),
-            data.get("sim_swearing_allowed"),
-        )
+
+        t0 = time.perf_counter()
+        try:
+            reply, latency_ms, prompt_chars, response_chars = await LLM_SERVICE.generate_sim_response_async(
+                sim_context,
+                sim_history[:-1],
+                llm_user_message,
+                data.get("sim_role_name"),
+                data.get("sim_opponent_style"),
+                data.get("sim_swearing_allowed"),
+            )
+            await track_event(
+                user_id=message.from_user.id if message.from_user else 0,
+                session_id=data.get("session_id") or "unknown",
+                event_name="sim_turn",
+                node_id=data.get("sim_node_id"),
+                latency_ms=latency_ms,
+                model=LLM_SERVICE.model,
+                prompt_chars=prompt_chars,
+                response_chars=response_chars,
+                meta={
+                    "turn": len(sim_history),
+                    "user_chars": len(user_text),
+                    "opponent_chars": len(reply),
+                },
+            )
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            reply = "Ошибка при генерации ответа оппонента."
+            error_short = str(e).replace("\n", " ")[:160]
+            await track_event(
+                user_id=message.from_user.id if message.from_user else 0,
+                session_id=data.get("session_id") or "unknown",
+                event_name="llm_error",
+                node_id=data.get("sim_node_id"),
+                latency_ms=latency_ms,
+                meta={"error": error_short},
+            )
+
 
     sim_history.append({"role": "opponent", "text": reply})
     await state.update_data(
@@ -931,16 +1106,99 @@ async def simulation_hint(callback: CallbackQuery, state: FSMContext) -> None:
         history = []
     history = history[-8:]
 
-    hint = await LLM_SERVICE.generate_coach_hint(
-        context=sim_context,
-        strategy_name=data.get("sim_strategy_name"),
-        strategy_rules=data.get("sim_strategy_rules"),
-        history=history,
-        last_user_message=data.get("last_user_message"),
-        last_opponent_message=last_opponent_message,
+    await track_event(
+        user_id=callback.from_user.id if callback.from_user else 0,
+        session_id=data.get("session_id") or "unknown",
+        event_name="hint_click",
+        node_id=data.get("sim_node_id"),
     )
 
+    t0 = time.perf_counter()
+    try:
+        hint = await LLM_SERVICE.generate_coach_hint(
+            context=sim_context,
+            strategy_name=data.get("sim_strategy_name"),
+            strategy_rules=data.get("sim_strategy_rules"),
+            history=history,
+            last_user_message=data.get("last_user_message"),
+            last_opponent_message=last_opponent_message,
+        )
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        error_short = str(e).replace("\n", " ")[:160]
+        await track_event(
+            user_id=callback.from_user.id if callback.from_user else 0,
+            session_id=data.get("session_id") or "unknown",
+            event_name="llm_error",
+            node_id=data.get("sim_node_id"),
+            latency_ms=latency_ms,
+            meta={"error": error_short, "where": "sim_hint"},
+        )
+        await callback.message.answer("Ошибка при генерации подсказки.", reply_markup=simulation_kb())
+        await callback.answer()
+        return
+
     await callback.message.answer(text=hint, reply_markup=simulation_kb())
+    await callback.answer()
+
+
+@router.callback_query(Simulation.active, F.data == "sim:draft")
+async def simulation_draft(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    last_opponent_message = data.get("last_opponent_message")
+    if not isinstance(last_opponent_message, str) or not last_opponent_message.strip():
+        await callback.answer("Сначала отправь сообщение, чтобы я ответил оппонентом.", show_alert=True)
+        return
+
+    if not LLM_SERVICE:
+        await callback.message.answer("Ошибка: LLM сервис не настроен.", reply_markup=simulation_kb())
+        await callback.answer()
+        return
+
+    await track_event(
+        user_id=callback.from_user.id if callback.from_user else 0,
+        session_id=data.get("session_id") or "unknown",
+        event_name="draft_click",
+        node_id=data.get("sim_node_id"),
+    )
+
+    sim_context = data.get("sim_context")
+    if not isinstance(sim_context, str) or not sim_context:
+        sim_inputs: dict = data.get("sim_inputs", {})
+        sim_context = "\n".join(f"{k}: {v}" for k, v in sim_inputs.items()) or "—"
+        await state.update_data(sim_context=sim_context)
+
+    history = data.get("sim_history", [])
+    if not isinstance(history, list):
+        history = []
+    history = history[-8:]
+
+    t0 = time.perf_counter()
+    try:
+        draft = await LLM_SERVICE.generate_coach_hint(
+            context=sim_context,
+            strategy_name=data.get("sim_strategy_name"),
+            strategy_rules=data.get("sim_strategy_rules"),
+            history=history,
+            last_user_message=data.get("last_user_message"),
+            last_opponent_message=last_opponent_message,
+        )
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        error_short = str(e).replace("\n", " ")[:160]
+        await track_event(
+            user_id=callback.from_user.id if callback.from_user else 0,
+            session_id=data.get("session_id") or "unknown",
+            event_name="llm_error",
+            node_id=data.get("sim_node_id"),
+            latency_ms=latency_ms,
+            meta={"error": error_short, "where": "sim_draft"},
+        )
+        await callback.message.answer("Ошибка при генерации черновика.", reply_markup=simulation_kb())
+        await callback.answer()
+        return
+
+    await callback.message.answer(text=draft, reply_markup=simulation_kb())
     await callback.answer()
 
 

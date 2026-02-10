@@ -1,12 +1,15 @@
 """LLM service: Groq client + Jinja2 template rendering."""
 
 import asyncio
+import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import jinja2
 from groq import Groq
+
+_T = TypeVar("_T")
 
 
 class LLMService:
@@ -45,6 +48,39 @@ class LLMService:
                 context["config"] = config
         return context
 
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int) and status >= 500:
+            return True
+        msg = str(exc).lower()
+        return any(s in msg for s in ["timeout", "timed out", "temporarily", "try again", "service unavailable"])
+
+    async def _call_with_timeout_and_retry(
+        self,
+        fn: Callable[[], _T],
+        *,
+        timeout_sec: int = 20,
+        retries: int = 1,
+        retry_delay_sec: float = 0.7,
+    ) -> _T:
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(fn), timeout=timeout_sec)
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                transient = True
+            except Exception as e:
+                last_exc = e
+                transient = self._is_transient_error(e)
+
+            if attempt < retries and transient:
+                await asyncio.sleep(retry_delay_sec)
+                continue
+            assert last_exc is not None
+            raise last_exc
+
     async def generate_advice_async(
         self,
         template_name: str,
@@ -66,11 +102,16 @@ class LLMService:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
             )
-            
-        response = await asyncio.to_thread(_call)
+
+        timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
+        response = await self._call_with_timeout_and_retry(
+            _call,
+            timeout_sec=timeout_sec,
+            retries=1,
+        )
         latency_ms = int((time.perf_counter() - start_time) * 1000)
         result_text = response.choices[0].message.content or ""
-        
+
         return result_text, latency_ms, len(prompt), len(result_text)
 
     def generate_advice(
@@ -126,10 +167,15 @@ class LLMService:
                 temperature=temperature,
             )
 
-        response = await asyncio.to_thread(_call)
+        timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
+        response = await self._call_with_timeout_and_retry(
+            _call,
+            timeout_sec=timeout_sec,
+            retries=1,
+        )
         latency_ms = int((time.perf_counter() - start_time) * 1000)
         result_text = response.choices[0].message.content or ""
-        
+
         return result_text, latency_ms, len(prompt), len(result_text)
 
     def generate_sim_response(
@@ -192,4 +238,9 @@ class LLMService:
             )
             return response.choices[0].message.content or ""
 
-        return await asyncio.to_thread(_call)
+        timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
+        return await self._call_with_timeout_and_retry(
+            _call,
+            timeout_sec=timeout_sec,
+            retries=1,
+        )

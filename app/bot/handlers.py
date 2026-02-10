@@ -32,7 +32,9 @@ from app.core.feedback_db import save_feedback
 from app.core.graph import get_root_node_id, load_graph
 from app.core.llm import LLMService
 from app.core.analytics import track_event, infer_branch
+from app.core.limits_db import get_counter, inc_counter, today_str
 from app.core.metrics import get_metrics, format_metrics_message
+from app.core.rate_limit import check as rl_check
 import os
 
 router = Router(name="brain_gps")
@@ -43,6 +45,21 @@ LLM_SERVICE: LLMService | None = None
 
 # Last simulation context per user (for Practice Mode button)
 LAST_SIMULATION_CONTEXT: dict[int, dict[str, Any]] = {}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+FREE_REGENERATIONS_PER_DAY = _env_int("FREE_REGENERATIONS_PER_DAY", 2)
+SIM_MAX_TURNS_FREE = _env_int("SIM_MAX_TURNS_FREE", 30)
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_username")
 
 
 async def _safe_callback_answer(callback: CallbackQuery, *args: Any, **kwargs: Any) -> None:
@@ -344,6 +361,26 @@ async def _generate_and_send(
     data = await state.get_data() if state else {}
     session_id = data.get("session_id") or "unknown"
 
+    # Technical safeguard: minimum interval between expensive generations
+    if success_event_name == "final_generated":
+        rl = rl_check(user_id, "final_generate", 15)
+        if not rl.allowed:
+            wait = rl.wait_sec
+            text = f"Слишком часто. Подожди {wait} сек."
+            await track_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_name="rate_limited",
+                node_id=node_id,
+                strategy_id=node_id,
+                meta={"key": "final_generate", "wait": wait},
+            )
+            if isinstance(target, CallbackQuery):
+                await _safe_callback_answer(target, text, show_alert=False)
+            else:
+                await target.answer(text)
+            return
+
     if not LLM_SERVICE:
         result = "Ошибка: LLM сервис не настроен."
         await track_event(
@@ -486,6 +523,18 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         event_name="start",
     )
     await _show_node(message, root_id, state)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    text = (
+        "BrainGPS помогает быстро выбрать стратегию ответа и получить готовый скрипт.\n\n"
+        "Старт: /start\n"
+        "Сброс: /start или \"В меню\"\n"
+        "Если застрял(а): \"Сбросить сценарий\"\n"
+        f"Контакт: {SUPPORT_CONTACT}"
+    )
+    await message.answer(text)
 
 
 @router.message(Command("metrics"))
@@ -655,6 +704,10 @@ async def on_action_callback(callback: CallbackQuery, state: FSMContext) -> None
 async def final_regen(callback: CallbackQuery, state: FSMContext) -> None:
     await _safe_callback_answer(callback)
     data = await state.get_data()
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    session_id = data.get("session_id") or "unknown"
+
     node_id = data.get("last_generated_node_id")
     inputs = data.get("last_generated_inputs")
     if not isinstance(node_id, str) or not node_id:
@@ -662,6 +715,51 @@ async def final_regen(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if not isinstance(inputs, dict):
         inputs = {}
+
+    # Analytics: click intent
+    await track_event(
+        user_id=user_id,
+        session_id=session_id,
+        event_name="regenerate_click",
+        node_id=node_id,
+        strategy_id=node_id,
+    )
+
+    # Technical safeguard: per-user rate limit
+    rl = rl_check(user_id, "regen", 10)
+    if not rl.allowed:
+        wait = rl.wait_sec
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="rate_limited",
+            node_id=node_id,
+            strategy_id=node_id,
+            meta={"key": "regen", "wait": wait},
+        )
+        await _safe_callback_answer(callback, f"Слишком часто. Подожди {wait} сек.", show_alert=False)
+        return
+
+    # Daily free limit (per calendar day, server time)
+    limit = int(FREE_REGENERATIONS_PER_DAY)
+    day = today_str()
+    current = await get_counter(user_id, day, "regen")
+    if current >= limit:
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="regenerate_limited",
+            node_id=node_id,
+            strategy_id=node_id,
+            meta={"limit": limit, "count": current, "day": day},
+        )
+        if callback.message:
+            await callback.message.answer(
+                f"Лимит бесплатных перегенераций на сегодня исчерпан ({limit}/{limit}). Попробуй завтра или измени вводные."
+            )
+        return
+
+    await inc_counter(user_id, day, "regen", delta=1)
 
     await state.update_data(
         feedback_sent_for_message_id=None,
@@ -878,6 +976,7 @@ async def start_simulation(callback: CallbackQuery, state: FSMContext) -> None:
         sim_node_id=ctx["node_id"],
         sim_inputs=ctx["inputs"],
         sim_history=[],
+        sim_turn_count=0,
         sim_context=sim_context,
         sim_strategy_name=strategy_name,
         sim_strategy_rules=strategy_rules,
@@ -999,18 +1098,57 @@ async def process_sim_message(message: Message, state: FSMContext) -> None:
 
     user_text = message.text.strip()
     data = await state.get_data()
+
+    user_id = message.from_user.id if message.from_user else 0
+    session_id = data.get("session_id") or "unknown"
+    sim_node_id = data.get("sim_node_id")
+
+    # Technical safeguard: per-user rate limit
+    rl = rl_check(user_id, "sim_turn", 2)
+    if not rl.allowed:
+        wait = rl.wait_sec
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="rate_limited",
+            node_id=sim_node_id,
+            strategy_id=sim_node_id if isinstance(sim_node_id, str) else None,
+            meta={"key": "sim_turn", "wait": wait},
+        )
+        await message.answer(f"Слишком часто. Подожди {wait} сек.")
+        return
+
+    # Technical safeguard: per-session simulation turns limit
+    turn_count = data.get("sim_turn_count", 0)
+    if not isinstance(turn_count, int):
+        turn_count = 0
+    if turn_count >= int(SIM_MAX_TURNS_FREE):
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="sim_limited",
+            node_id=sim_node_id,
+            strategy_id=sim_node_id if isinstance(sim_node_id, str) else None,
+            meta={"limit": int(SIM_MAX_TURNS_FREE), "turn": turn_count},
+        )
+        await message.answer(
+            "Лимит реплик симуляции на эту сессию исчерпан. Нажми /start или \"В меню\".",
+            reply_markup=simulation_kb(),
+        )
+        return
+
+    turn_count += 1
+    await state.update_data(sim_turn_count=turn_count, last_user_message=user_text)
+
     sim_inputs: dict = data.get("sim_inputs", {})
     sim_history: list = data.get("sim_history", [])
 
     llm_user_message = user_text
-    sim_node_id = data.get("sim_node_id")
     if sim_node_id in {"strat_fam_scandal_stop", "strat_fam_scandal_contain"}:
         llm_user_message = (
             "(Это сообщение пользователя, адресовано ТЕБЕ — оппоненту. Пользователь описывает свои действия/границы.)\n"
             f"{user_text}"
         )
-
-    await state.update_data(last_user_message=user_text)
 
     sim_history.append({"role": "user", "text": user_text})
 
@@ -1050,7 +1188,7 @@ async def process_sim_message(message: Message, state: FSMContext) -> None:
                 prompt_chars=prompt_chars,
                 response_chars=response_chars,
                 meta={
-                    "turn": len(sim_history),
+                    "turn": turn_count,
                     "user_chars": len(user_text),
                     "opponent_chars": len(reply),
                 },
@@ -1088,6 +1226,24 @@ async def simulation_hint(callback: CallbackQuery, state: FSMContext) -> None:
     last_opponent_message = data.get("last_opponent_message")
     if not isinstance(last_opponent_message, str) or not last_opponent_message.strip():
         await callback.answer("Сначала отправь сообщение, чтобы я ответил оппонентом.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    session_id = data.get("session_id") or "unknown"
+    sim_node_id = data.get("sim_node_id")
+
+    rl = rl_check(user_id, "hint", 5)
+    if not rl.allowed:
+        wait = rl.wait_sec
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="rate_limited",
+            node_id=sim_node_id,
+            strategy_id=sim_node_id if isinstance(sim_node_id, str) else None,
+            meta={"key": "hint", "wait": wait},
+        )
+        await callback.answer(f"Слишком часто. Подожди {wait} сек.", show_alert=False)
         return
 
     if not LLM_SERVICE:
@@ -1148,6 +1304,24 @@ async def simulation_draft(callback: CallbackQuery, state: FSMContext) -> None:
     last_opponent_message = data.get("last_opponent_message")
     if not isinstance(last_opponent_message, str) or not last_opponent_message.strip():
         await callback.answer("Сначала отправь сообщение, чтобы я ответил оппонентом.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    session_id = data.get("session_id") or "unknown"
+    sim_node_id = data.get("sim_node_id")
+
+    rl = rl_check(user_id, "draft", 5)
+    if not rl.allowed:
+        wait = rl.wait_sec
+        await track_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_name="rate_limited",
+            node_id=sim_node_id,
+            strategy_id=sim_node_id if isinstance(sim_node_id, str) else None,
+            meta={"key": "draft", "wait": wait},
+        )
+        await callback.answer(f"Слишком часто. Подожди {wait} сек.", show_alert=False)
         return
 
     if not LLM_SERVICE:

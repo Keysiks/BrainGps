@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  braingps:
+    build: .
+    container_name: braingps-bot
+    restart: unless-stopped
+    environment:
+      - TG_BOT_TOKEN=${TG_BOT_TOKEN}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - FEEDBACK_DB_PATH=/var/lib/braingps/braingps.db
+      - SUPPORT_CONTACT=${SUPPORT_CONTACT}
+      - FREE_REGENERATIONS_PER_DAY=${FREE_REGENERATIONS_PER_DAY:-2}
+      - SIM_MAX_TURNS_FREE=${SIM_MAX_TURNS_FREE:-30}
+      - LLM_TIMEOUT_SEC=${LLM_TIMEOUT_SEC:-20}
+    volumes:
+      # Mount database directory to persist data
+      - braingps_data:/var/lib/braingps
+      # Optional: mount logs if you add logging to files
+      # - ./logs:/app/logs
+    networks:
+      - braingps_net
+
+volumes:
+  braingps_data:
+    driver: local
+
+networks:
+  braingps_net:
+    driver: bridge

@@ -39,4 +39,52 @@
 6. Запустите бота: `python main.py`
 
 ### Деплой на сервер
-Для продакшена используйте systemd + venv. Подробные инструкции см. в документации по деплою.
+
+#### Вариант 1: systemd + venv (рекомендуется для простоты)
+См. инструкцию выше в разделе "Установка".
+
+#### Вариант 2: Docker + docker-compose
+1. **Скопируй файлы на сервер:**
+   ```bash
+   git clone https://github.com/your-username/braingps.git
+   cd braingps
+   ```
+
+2. **Настрой окружение:**
+   ```bash
+   cp .env.example .env
+   nano .env  # заполни переменные
+   ```
+
+3. **Запусти через docker-compose:**
+   ```bash
+   docker-compose up -d
+   ```
+
+4. **Проверь статус:**
+   ```bash
+   docker-compose logs -f
+   docker-compose ps
+   ```
+
+5. **Остановка и обновление:**
+   ```bash
+   docker-compose down
+   git pull
+   docker-compose up -d --build
+   ```
+
+**Преимущества Docker:**
+- Изолированное окружение
+- Автоматический рестарт
+- Volume для базы данных (`/var/lib/braingps` внутри контейнера)
+- Простое обновление
+
+**Переменные окружения в .env:**
+- `TG_BOT_TOKEN`: токен бота
+- `GROQ_API_KEY`: API ключ Groq
+- `ADMIN_IDS`: ID админов через запятую
+- `SUPPORT_CONTACT`: контакт для поддержки
+- `FREE_REGENERATIONS_PER_DAY`: лимит перегенераций (по умолчанию 2)
+- `SIM_MAX_TURNS_FREE`: лимит ходов в симуляции (по умолчанию 30)
+- `LLM_TIMEOUT_SEC`: таймаут LLM (по умолчанию 20)

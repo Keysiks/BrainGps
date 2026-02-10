@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-DB_PATH = "/var/lib/braingps/braingps.db"
+# Default keeps prior Linux path; override locally via FEEDBACK_DB_PATH in .env
+DEFAULT_DB_PATH = "/var/lib/braingps/braingps.db"
+
+
+def _db_path() -> str:
+    # Read env at runtime (dotenv may be loaded after module import)
+    return os.getenv("FEEDBACK_DB_PATH", DEFAULT_DB_PATH)
 
 
 async def init_db() -> None:
     """Create feedback table and indexes if they don't exist."""
-    db_file = Path(DB_PATH)
+    db_path = _db_path()
+    db_file = Path(db_path)
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
 CREATE TABLE IF NOT EXISTS feedback (
@@ -65,7 +73,9 @@ async def save_feedback(
     ts = int(time.time())
     meta_json = json.dumps(meta or {}, ensure_ascii=False)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    db_path = _db_path()
+
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
 INSERT INTO feedback (

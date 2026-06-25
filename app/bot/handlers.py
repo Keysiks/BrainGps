@@ -61,6 +61,52 @@ FREE_REGENERATIONS_PER_DAY = _env_int("FREE_REGENERATIONS_PER_DAY", 2)
 SIM_MAX_TURNS_FREE = _env_int("SIM_MAX_TURNS_FREE", 30)
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@your_username")
 
+# Поля формы, раскрывающие приватную стратегию/цель/заготовленный ответ пользователя.
+# Их НЕЛЬЗЯ показывать оппоненту в симуляции (иначе он заранее знает план пользователя),
+# но они остаются доступны коучу (подсказка/черновик помогают именно пользователю).
+OPPONENT_HIDDEN_FIELDS: frozenset[str] = frozenset(
+    {
+        "desired_sum",
+        "desired_bonus",
+        "why_stay",
+        "future_promise",
+        "goal",
+        "action_plan",
+        "prevention",
+        "handover_plan",
+        "gratitude_point",
+        "ping_text",
+        "fact_needed",
+    }
+)
+
+_SCANDAL_NODES = {"strat_fam_scandal_stop", "strat_fam_scandal_contain"}
+_SCANDAL_PREAMBLE = (
+    "РОЛИ: Ты — супруг(а), который(ая) только что сорвался(ась): кричал(а)/оскорблял(а). "
+    "Пользователь — тот, кого обидели. "
+    "Не говори от лица пользователя и не объявляй, что 'берешь паузу' вместо него.\n"
+)
+
+
+def _format_sim_inputs(inputs: dict[str, Any], *, hide_private: bool = False) -> str:
+    """Join sim inputs into a context string; optionally drop private strategy fields."""
+    if not isinstance(inputs, dict):
+        return "—"
+    items = [
+        (k, v)
+        for k, v in inputs.items()
+        if not (hide_private and k in OPPONENT_HIDDEN_FIELDS)
+    ]
+    return "\n".join(f"{k}: {v}" for k, v in items) or "—"
+
+
+def _build_sim_context(node_id: Any, inputs: dict[str, Any], *, hide_private: bool = False) -> str:
+    """Build simulation context. hide_private=True для оппонента, False для коуча."""
+    body = _format_sim_inputs(inputs, hide_private=hide_private)
+    if node_id in _SCANDAL_NODES:
+        return _SCANDAL_PREAMBLE + body
+    return body
+
 
 async def _safe_callback_answer(callback: CallbackQuery, *args: Any, **kwargs: Any) -> None:
     """Answer callback query but ignore cases when query is already expired."""
@@ -963,14 +1009,9 @@ async def start_simulation(callback: CallbackQuery, state: FSMContext) -> None:
     if not isinstance(strategy_rules, list):
         strategy_rules = []
 
-    sim_context = "\n".join(f"{k}: {v}" for k, v in ctx["inputs"].items()) or "—"
-    if ctx["node_id"] in {"strat_fam_scandal_stop", "strat_fam_scandal_contain"}:
-        sim_context = (
-            "РОЛИ: Ты — супруг(а), который(ая) только что сорвался(ась): кричал(а)/оскорблял(а). "
-            "Пользователь — тот, кого обидели. "
-            "Не говори от лица пользователя и не объявляй, что 'берешь паузу' вместо него.\n"
-            + sim_context
-        )
+    # Полный контекст — для коуча (подсказка/черновик). Урезанный — для оппонента.
+    sim_context = _build_sim_context(ctx["node_id"], ctx["inputs"], hide_private=False)
+    sim_opponent_context = _build_sim_context(ctx["node_id"], ctx["inputs"], hide_private=True)
 
     await state.update_data(
         sim_node_id=ctx["node_id"],
@@ -978,6 +1019,7 @@ async def start_simulation(callback: CallbackQuery, state: FSMContext) -> None:
         sim_history=[],
         sim_turn_count=0,
         sim_context=sim_context,
+        sim_opponent_context=sim_opponent_context,
         sim_strategy_name=strategy_name,
         sim_strategy_rules=strategy_rules,
         sim_role_name=role_name,
@@ -1163,15 +1205,18 @@ async def process_sim_message(message: Message, state: FSMContext) -> None:
             meta={"error": "LLM_SERVICE not initialized"},
         )
     else:
-        sim_context = data.get("sim_context")
-        if not isinstance(sim_context, str) or not sim_context:
-            sim_context = "\n".join(f"{k}: {v}" for k, v in sim_inputs.items()) or "—"
-            await state.update_data(sim_context=sim_context)
+        # Оппонент получает урезанный контекст без приватной стратегии пользователя.
+        sim_opponent_context = data.get("sim_opponent_context")
+        if not isinstance(sim_opponent_context, str) or not sim_opponent_context:
+            sim_opponent_context = _build_sim_context(
+                data.get("sim_node_id"), sim_inputs, hide_private=True
+            )
+            await state.update_data(sim_opponent_context=sim_opponent_context)
 
         t0 = time.perf_counter()
         try:
             reply, latency_ms, prompt_chars, response_chars = await LLM_SERVICE.generate_sim_response_async(
-                sim_context,
+                sim_opponent_context,
                 sim_history[:-1],
                 llm_user_message,
                 data.get("sim_role_name"),

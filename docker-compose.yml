@@ -7,7 +7,9 @@ services:
     restart: unless-stopped
     environment:
       - TG_BOT_TOKEN=${TG_BOT_TOKEN}
-      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://hydragpt.ru/v1}
+      - LLM_MODEL=${LLM_MODEL:-kimi-k2p6}
       - ADMIN_IDS=${ADMIN_IDS}
       - FEEDBACK_DB_PATH=/var/lib/braingps/braingps.db
       - SUPPORT_CONTACT=${SUPPORT_CONTACT}

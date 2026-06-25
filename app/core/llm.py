@@ -1,4 +1,4 @@
-"""LLM service: Groq client + Jinja2 template rendering."""
+"""LLM service: HydraGPT (OpenAI-compatible) client + Jinja2 template rendering."""
 
 import asyncio
 import os
@@ -7,22 +7,31 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 import jinja2
-from groq import Groq
+from openai import OpenAI
 
 _T = TypeVar("_T")
 
+# HydraGPT proxy (OpenAI-compatible endpoint). Override via LLM_BASE_URL if needed.
+DEFAULT_BASE_URL = "https://hydragpt.ru/v1"
+# Default model; full list at /models (kimi-k2p7, minimax-m3, nemotron-3-ultra, ...).
+DEFAULT_MODEL = "kimi-k2p6"
+
 
 class LLMService:
-    """Groq-based LLM service with Jinja2 template support."""
+    """HydraGPT-based LLM service (OpenAI-compatible) with Jinja2 template support."""
 
     def __init__(
         self,
         api_key: str,
         template_dir: Path | str | None = None,
-        model: str = "llama-3.3-70b-versatile",
+        model: str | None = None,
+        base_url: str | None = None,
     ) -> None:
-        self._client = Groq(api_key=api_key)
-        self._model = model
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url or os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL),
+        )
+        self._model = model or os.getenv("LLM_MODEL", DEFAULT_MODEL)
 
         if template_dir is None:
             template_dir = Path(__file__).resolve().parent.parent.parent / "data" / "prompts"
@@ -87,7 +96,7 @@ class LLMService:
         context: dict[str, Any],
     ) -> tuple[str, int, int, int]:
         """
-        Render a Jinja2 template and call Groq to generate advice asynchronously.
+        Render a Jinja2 template and call the LLM to generate advice asynchronously.
         Returns (result_text, latency_ms, prompt_chars, response_chars)
         """
         context = self._normalize_context(context)

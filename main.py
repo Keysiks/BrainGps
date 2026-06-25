@@ -29,18 +29,18 @@ async def main() -> None:
     import os
 
     token = os.getenv("TG_BOT_TOKEN")
-    groq_key = os.getenv("GROQ_API_KEY")
+    llm_key = os.getenv("LLM_API_KEY")
     if not token:
         raise ValueError("TG_BOT_TOKEN is required in .env")
-    if not groq_key:
-        raise ValueError("GROQ_API_KEY is required in .env")
+    if not llm_key:
+        raise ValueError("LLM_API_KEY is required in .env")
 
     graph_dir = Path(__file__).parent / "data" / "graph"
     graph = load_graph(graph_dir)
     logger.info("Loaded graph with %d nodes", len(graph))
 
     prompts_dir = Path(__file__).parent / "data" / "prompts"
-    llm_service = LLMService(api_key=groq_key, template_dir=prompts_dir)
+    llm_service = LLMService(api_key=llm_key, template_dir=prompts_dir)
     init_handlers(graph, llm_service)
 
     await init_db()
